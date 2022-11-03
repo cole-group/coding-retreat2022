@@ -1,0 +1,302 @@
+'''
+Create input files for MM-ML switching corrections based on perses output.
+The input coordinates are the final coordinates from the lambda=0 or 1 coordinates
+from the edge, meaning that the starting point has effectively been equilibrated.
+
+Many functions have been copied or adapted from:
+- qmlify: https://github.com/choderalab/qmlify
+- openmmtools: https://github.com/dominicrufa/openmmtools/tree/ommml_compat (ommml_compat branch)
+'''
+
+import os
+import numpy as np
+from openmm import app, unit
+from openmmtools.openmm_torch import repex
+import openmm
+from openmm import app
+from openeye import oechem
+import pickle as pk
+import MDAnalysis as mda
+from MDAnalysis import transformations as trans
+import shutil
+import argparse
+
+def write_pickle(object, pickle_filename):
+    """
+    write a pickle
+
+    arguments
+        object : object
+            picklable object
+        pickle_filename : str
+            name of pickle
+    """
+    import pickle
+    with open(pickle_filename, 'wb') as f:
+        pickle.dump(object, f)
+
+
+def deserialize_xml(xml_filename):
+    """
+    Load and deserialize an xml. From openmmtools.
+
+    arguments
+        xml_filename : str
+            full path of the xml filename
+
+    returns
+        xml_deserialized : deserialized xml object
+    """
+    from simtk.openmm import XmlSerializer
+    with open(xml_filename, 'r') as infile:
+        xml_readable = infile.read()
+    xml_deserialized = XmlSerializer.deserialize(xml_readable)
+    return xml_deserialized
+
+
+def serialize_xml(object, xml_filename):
+    """
+    Load and deserialize an xml. From openmmtools.
+
+    arguments
+        object : object
+            serializable
+        xml_filename : str
+            full path of the xml filename
+    """
+    from simtk.openmm import XmlSerializer
+    with open(xml_filename, 'w') as outfile:
+        serial = XmlSerializer.serialize(object)
+        outfile.write(serial)
+
+
+def extract_sys_top(edge_outdir, phase, new_or_old, correction_outdir, factory_npz = 'out-hybrid_factory.npy.npz'):
+    """
+    Given a htf_factory.npz, will extract all phases, serialize systems and pickle topologies. Adapted from qmlify.
+
+    arguments
+        edge_outdir : str
+            path that contains factory_npz
+        phase : str
+            phase to extract
+        new_or_old : str
+            whether the ligand is 'new' or 'old' with respect to the transformation
+            on the edge
+        correction_outdir : str
+            path to write systems and topologies
+        factory_npz : str
+            .npz of perses.relative.HybridTopologyFactory
+    """
+    #load the npz
+    npz = np.load(os.path.join(edge_outdir, factory_npz), allow_pickle=True)
+    systems_dict = npz['arr_0'].item()
+    if new_or_old == "new":
+        system = systems_dict[phase]._new_system
+        sys_filename = os.path.join(correction_outdir, f"system.xml")
+        topology = systems_dict[phase]._topology_proposal.new_topology
+        top_filename = os.path.join(correction_outdir, f"topology.pkl")
+    elif new_or_old == "old":
+        system = systems_dict[phase]._old_system
+        sys_filename = os.path.join(correction_outdir, f"system.xml")
+        topology = systems_dict[phase]._topology_proposal.old_topology
+        top_filename = os.path.join(correction_outdir, f"topology.pkl")
+    else:
+        raise ValueError("new_or_old must be 'new' or 'old'")
+    
+    # Write system and topology to correction_outdir
+    serialize_xml(system, sys_filename)
+    write_pickle(topology, top_filename)
+
+
+def open_netcdf(filename):
+    from netCDF4 import Dataset
+    return Dataset(filename, 'r')
+    
+
+def extract_perses_repex_to_local(edge_outdir, phase, new_or_old, correction_outdir):
+    """
+    Extract perses data from nonlocal directory and copy to local; extract positions, topology, and system for each phase.
+    Adapted from openmmtools.
+
+    arguments
+        edge_outdir : str
+            path that contains factory_npz
+        phase : str
+            phase to extract
+        new_or_old : str
+            whether the ligand is 'new' or 'old' with respect to the transformation
+            on the edge
+        correction_outdir : str
+            path to write systems and topologies
+    """
+    factory_npz_path = os.path.join(edge_outdir, 'out-hybrid_factory.npy.npz')
+    os.system(f"cp {factory_npz_path} {os.path.join(correction_outdir, 'out-hybrid_factory.npy.npz')}")
+    extract_sys_top(edge_outdir, phase, new_or_old, correction_outdir)
+    npz = np.load(factory_npz_path, allow_pickle=True)
+    htf = npz['arr_0'].item()
+
+    #topology proposal
+    top_proposal_filename = os.path.join(edge_outdir, f"out-topology_proposals.pkl")
+    TPs = np.load(top_proposal_filename, allow_pickle=True)
+
+    nc_checkpoint_filename = os.path.join(edge_outdir, f"out-{phase}_checkpoint.nc")
+    nc_checkpoint = open_netcdf(nc_checkpoint_filename) #yank the checkpoint interval
+    checkpoint_interval = nc_checkpoint.CheckpointInterval
+    all_positions = nc_checkpoint.variables['positions'] #pull all of the positions
+    bv = nc_checkpoint.variables['box_vectors'] #pull the box vectors
+    n_iter, n_replicas, n_atom, _ = np.shape(all_positions)
+    nc_out_filename = os.path.join(edge_outdir, f"out-{phase}.nc")
+    nc = open_netcdf(nc_out_filename)
+    
+    # Get correct endstate
+    if new_or_old == "old":
+        endstate = ('ligandAlambda0','old',0) 
+    elif new_or_old == "new":
+        endstate = ('ligandBlambda1','new',n_replicas-1)
+    else:
+        raise ValueError("new_or_old must be 'new' or 'old'")
+    lig, state, replica = endstate
+
+    topology = getattr(TPs[f'{phase}_topology_proposal'], f'{state}_topology')
+    n_atoms = topology.getNumAtoms()
+    h_to_state = getattr(htf[f"{phase}"], f'_hybrid_to_{state}_map')
+    positions = np.zeros(shape=(n_atoms,3))
+
+    # Only take positions from final frame, so input is effectively equilibrated
+    final_frame_idx = n_iter - 1
+    replica_id = np.where(nc.variables['states'][final_frame_idx*checkpoint_interval] == replica)[0]
+    pos = all_positions[final_frame_idx, replica_id,:,:][0]
+    for hybrid, index in h_to_state.items():
+        positions[index,:] = pos[hybrid]
+    bv_frame = bv[final_frame_idx, replica_id][0]
+
+    np.savetxt(os.path.join(correction_outdir, f"pbc.dat"), bv_frame)
+    np.savetxt(os.path.join(correction_outdir, f"positions.dat"), positions)
+
+
+# Functions to create PDBs from positions and topologies
+
+def write_pdb(top, pos, filename):
+    """Write a pdb given topology and positions
+
+    Args:
+        top : Topology
+        pos : Positions
+        filename (str): Name of the pdb file to write
+    """
+    filename = open(filename, 'w')
+    app.PDBFile.writeHeader(top, filename)
+    app.PDBFile.writeModel(top, pos, filename)
+    app.PDBFile.writeFooter(top, filename)
+
+def create_pdb(correction_outdir):
+    """Create a pdb given the correction output directory
+
+    Args:
+        correction_outdir (str): Path to the correction output directory
+    """
+    positions = np.loadtxt(os.path.join(correction_outdir, "positions.dat")) * 10
+    topology = pk.load(open(os.path.join(correction_outdir, "topology.pkl"), 'rb'))
+    write_pdb(topology, positions, os.path.join(correction_outdir, "system.pdb"))
+
+def extract_ligand_input(lig_name, perses_outdir=".", mmml_outdir="mmml_corrections"):
+    """Extract input files for MM-ML switching corrections from perses output
+
+    Args:
+        lig_name (str) : Name of ligand for which output is extracted
+        perses_outdir (str, optional): Path to perses output dir. Defaults to ".".
+        mmml_outdir (str, optional): Path to mmml corrections dir. Defaults to "mmml_corrections".
+    """
+    # Find directory with required data
+    edge_out_dirs = [d for d in os.listdir(perses_outdir) if d[:4] == "edge"]
+
+    # Take first output dir including ligand as end point
+    edge_out_dir = [d for d in edge_out_dirs if lig_name in d][0]
+
+    # Check if ligand is "old" or "new"
+    new_or_old = "old"
+    if lig_name == edge_out_dir.split('_')[3:]:
+        new_or_old = "new"
+
+    for phase in ["complex", "solvent"]:
+        # Make output directory
+        specific_mmml_out_dir = os.path.join(mmml_outdir, lig_name, phase)
+
+        # Extract input files
+        extract_perses_repex_to_local(edge_out_dir, phase, new_or_old, specific_mmml_out_dir)
+        create_pdb(specific_mmml_out_dir) 
+        shutil.copy(os.path.join(f"{edge_out_dir}/xml", f"{phase}-{new_or_old}-system.gz"), f"{specific_mmml_out_dir}/system.gz")
+
+
+def get_lig_names(perses_outdir="."):
+    """Get names of all ligands in perses output
+
+    Args:
+        perses_outdir (str, optional): Path to perses output directory. Defaults to ".".
+
+    Returns:
+        list of str: List of ligand names
+    """
+    # Get all edge output dirs
+    out_dirs = [d for d in os.listdir(perses_outdir) if d[:4] == "edge"]
+    # Function to extract lig names from each edge
+    dir_to_ligs = lambda x: ("_".join(x.split('_')[1:3]) , "_".join(x.split('_')[3:]))
+    # Get unique lig names
+    lig_names = set([l for d in out_dirs for l in dir_to_ligs(d)])
+
+    return lig_names
+
+
+def create_output_dirs(perses_outdir=".", mmml_outdir="mmml_corrections", lig_names=None):
+    """Create output directories for MM-ML switching corrections for all ligands in
+    RBFE network.
+
+    Args:
+        perses_outdir (str, optional): Path to perses output directory. Defaults to ".".
+        mmml_outdir (str, optional): Name of mmml output directory to create. Defaults to "mmml_corrections".
+        lig_names (_type_, optional): List of ligand names. Defaults to None, resulting in the use of all ligands
+        in network.
+    """
+    # Get lig names
+    if lig_names is None:
+        lig_names = get_lig_names(perses_outdir)
+
+    # Make output dirs
+    for lig_name in lig_names:
+        os.makedirs(f"{mmml_outdir}/{lig_name}/solvent", exist_ok=True)
+        os.makedirs(f"{mmml_outdir}/{lig_name}/complex", exist_ok=True)
+
+
+def extract_all_input(perses_outdir=".", mmml_outdir="mmml_corrections"):
+    """Extract input files for MM-ML switching corrections from perses output
+
+    Args:
+        perses_outdir (str, optional): Path to perses output dir. Defaults to ".".
+        mmml_outdir (str, optional): Path to mmml corrections dir. Defaults to "mmml_corrections".
+    """
+    # Get lig names
+    lig_names = get_lig_names(perses_outdir)
+
+    # Create dirs for mm-ml output
+    create_output_dirs(perses_outdir, mmml_outdir, lig_names)
+
+    # Extract input files
+    for lig_name in lig_names:
+        print(f"Extracting input for {lig_name}")
+        extract_ligand_input(lig_name, perses_outdir, mmml_outdir)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--perses_outdir", type=str, default=".", help="Path to perses output dir")
+    parser.add_argument("--mmml_outdir", type=str, default="mmml_corrections", help="Path to mmml corrections dir")
+    parser.add_argument("--lig_name", type=str, default=None, help="Name of ligand to extract")
+    args = parser.parse_args()
+
+    if args.lig_name is not None:
+        extract_ligand_input(args.lig_name, args.perses_outdir, args.mmml_outdir)
+    else:
+        extract_all_input(args.perses_outdir, args.mmml_outdir)
+
+
+if __name__ == '__main__':
+    main()
