@@ -91,13 +91,9 @@ def extract_sys_top(edge_outdir, phase, new_or_old, correction_outdir, factory_n
     if new_or_old == "new":
         topology = systems_dict[phase]._topology_proposal.new_topology
         system = systems_dict[phase]._new_system
-        # Remove intra-ligand constraints
-        system = remove_constraints(system, topology)
     elif new_or_old == "old":
         topology = systems_dict[phase]._topology_proposal.old_topology
         system = systems_dict[phase]._old_system
-        # Remove intra-ligand constraints
-        system = remove_constraints(system, topology)
     else:
         raise ValueError("new_or_old must be 'new' or 'old'")
     
