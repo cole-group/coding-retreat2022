@@ -10,16 +10,14 @@ Many functions have been copied or adapted from:
 
 import os
 import numpy as np
-from openmm import app, unit
-from openmmtools.openmm_torch import repex
+from openmm import app
+from openmmtools.openmm_torch.repex import get_atoms_from_resname
 import openmm
 from openmm import app
-from openeye import oechem
+from openeye import oechem # Required for unpickling
 import pickle as pk
-import MDAnalysis as mda
-from MDAnalysis import transformations as trans
-import shutil
 import argparse
+import xml.etree.ElementTree as ET
 
 def write_pickle(object, pickle_filename):
     """
@@ -91,19 +89,17 @@ def extract_sys_top(edge_outdir, phase, new_or_old, correction_outdir, factory_n
     npz = np.load(os.path.join(edge_outdir, factory_npz), allow_pickle=True)
     systems_dict = npz['arr_0'].item()
     if new_or_old == "new":
-        system = systems_dict[phase]._new_system
-        sys_filename = os.path.join(correction_outdir, f"system.xml")
         topology = systems_dict[phase]._topology_proposal.new_topology
-        top_filename = os.path.join(correction_outdir, f"topology.pkl")
+        system = systems_dict[phase]._new_system
     elif new_or_old == "old":
-        system = systems_dict[phase]._old_system
-        sys_filename = os.path.join(correction_outdir, f"system.xml")
         topology = systems_dict[phase]._topology_proposal.old_topology
-        top_filename = os.path.join(correction_outdir, f"topology.pkl")
+        system = systems_dict[phase]._old_system
     else:
         raise ValueError("new_or_old must be 'new' or 'old'")
     
     # Write system and topology to correction_outdir
+    top_filename = os.path.join(correction_outdir, f"topology.pkl")
+    sys_filename = os.path.join(correction_outdir, f"system.xml")
     serialize_xml(system, sys_filename)
     write_pickle(topology, top_filename)
 
@@ -113,7 +109,23 @@ def open_netcdf(filename):
     return Dataset(filename, 'r')
     
 
-def extract_perses_repex_to_local(edge_outdir, phase, new_or_old, correction_outdir):
+# Functions to create PDBs from positions and topologies
+
+def write_pdb(top, pos, filename):
+    """Write a pdb given topology and positions
+
+    Args:
+        top : Topology
+        pos : Positions
+        filename (str): Name of the pdb file to write
+    """
+    filename = open(filename, 'w')
+    app.PDBFile.writeHeader(top, filename)
+    app.PDBFile.writeModel(top, pos, filename)
+    app.PDBFile.writeFooter(top, filename)
+
+
+def extract_perses_repex_to_local(edge_outdir, phase, new_or_old, correction_outdir, n_snapshots=1):
     """
     Extract perses data from nonlocal directory and copy to local; extract positions, topology, and system for each phase.
     Adapted from openmmtools.
@@ -128,6 +140,8 @@ def extract_perses_repex_to_local(edge_outdir, phase, new_or_old, correction_out
             on the edge
         correction_outdir : str
             path to write systems and topologies
+        n_snapshots (int, optional): Number of snapshots to extract. Default is 1. If 1, this is extracted from the
+        end of the simulation, otherwise evenly-spaced snapshots are extracted.
     """
     factory_npz_path = os.path.join(edge_outdir, 'out-hybrid_factory.npy.npz')
     os.system(f"cp {factory_npz_path} {os.path.join(correction_outdir, 'out-hybrid_factory.npy.npz')}")
@@ -160,52 +174,42 @@ def extract_perses_repex_to_local(edge_outdir, phase, new_or_old, correction_out
     topology = getattr(TPs[f'{phase}_topology_proposal'], f'{state}_topology')
     n_atoms = topology.getNumAtoms()
     h_to_state = getattr(htf[f"{phase}"], f'_hybrid_to_{state}_map')
-    positions = np.zeros(shape=(n_atoms,3))
 
-    # Only take positions from final frame, so input is effectively equilibrated
-    final_frame_idx = n_iter - 1
-    replica_id = np.where(nc.variables['states'][final_frame_idx*checkpoint_interval] == replica)[0]
-    pos = all_positions[final_frame_idx, replica_id,:,:][0]
-    for hybrid, index in h_to_state.items():
-        positions[index,:] = pos[hybrid]
-    bv_frame = bv[final_frame_idx, replica_id][0]
+    # Get list of frame indices
+    frame_idxs = []
+    if n_snapshots == 1:
+        frame_idxs.append(n_iter - 1)
+    else:
+        frame_idxs = np.arange(0, n_iter, n_iter // n_snapshots)
+    
+    # Extract positions
+    for i, frame_idx in enumerate(frame_idxs):
+        positions = np.zeros(shape=(n_atoms,3))
+        replica_id = np.where(nc.variables['states'][frame_idx*checkpoint_interval] == replica)[0]
+        pos = all_positions[frame_idx, replica_id,:,:][0]
+        for hybrid, index in h_to_state.items():
+            positions[index,:] = pos[hybrid]
+        positions *= 10 # Convert nm to angstroms
 
-    np.savetxt(os.path.join(correction_outdir, f"pbc.dat"), bv_frame)
-    np.savetxt(os.path.join(correction_outdir, f"positions.dat"), positions)
+        # Get topology and write pdb
+        topology = pk.load(open(os.path.join(correction_outdir, "topology.pkl"), 'rb'))
+        if n_snapshots == 1:
+            ofile_name = "system_endstate"
+        else:
+            ofile_name = f"snapshot_{i}"
+
+        write_pdb(topology, positions, os.path.join(correction_outdir, f"{ofile_name}.pdb"))
 
 
-# Functions to create PDBs from positions and topologies
-
-def write_pdb(top, pos, filename):
-    """Write a pdb given topology and positions
-
-    Args:
-        top : Topology
-        pos : Positions
-        filename (str): Name of the pdb file to write
-    """
-    filename = open(filename, 'w')
-    app.PDBFile.writeHeader(top, filename)
-    app.PDBFile.writeModel(top, pos, filename)
-    app.PDBFile.writeFooter(top, filename)
-
-def create_pdb(correction_outdir):
-    """Create a pdb given the correction output directory
-
-    Args:
-        correction_outdir (str): Path to the correction output directory
-    """
-    positions = np.loadtxt(os.path.join(correction_outdir, "positions.dat")) * 10
-    topology = pk.load(open(os.path.join(correction_outdir, "topology.pkl"), 'rb'))
-    write_pdb(topology, positions, os.path.join(correction_outdir, "system.pdb"))
-
-def extract_ligand_input(lig_name, perses_outdir=".", mmml_outdir="mmml_corrections"):
+def extract_ligand_input(lig_name, perses_outdir=".", mmml_outdir="mmml_corrections", n_snapshots=1):
     """Extract input files for MM-ML switching corrections from perses output
 
     Args:
         lig_name (str) : Name of ligand for which output is extracted
         perses_outdir (str, optional): Path to perses output dir. Defaults to ".".
         mmml_outdir (str, optional): Path to mmml corrections dir. Defaults to "mmml_corrections".
+        n_snapshots (int, optional): Number of snapshots to extract. Default is 1. If 1, this is extracted from the
+        end of the simulation, otherwise evenly-spaced snapshots are extracted.
     """
     # Find directory with required data
     edge_out_dirs = [d for d in os.listdir(perses_outdir) if d[:4] == "edge"]
@@ -215,7 +219,7 @@ def extract_ligand_input(lig_name, perses_outdir=".", mmml_outdir="mmml_correcti
 
     # Check if ligand is "old" or "new"
     new_or_old = "old"
-    if lig_name == edge_out_dir.split('_')[3:]:
+    if lig_name == "_".join(edge_out_dir.split('_')[3:]):
         new_or_old = "new"
 
     for phase in ["complex", "solvent"]:
@@ -223,9 +227,7 @@ def extract_ligand_input(lig_name, perses_outdir=".", mmml_outdir="mmml_correcti
         specific_mmml_out_dir = os.path.join(mmml_outdir, lig_name, phase)
 
         # Extract input files
-        extract_perses_repex_to_local(edge_out_dir, phase, new_or_old, specific_mmml_out_dir)
-        create_pdb(specific_mmml_out_dir) 
-        shutil.copy(os.path.join(f"{edge_out_dir}/xml", f"{phase}-{new_or_old}-system.gz"), f"{specific_mmml_out_dir}/system.gz")
+        extract_perses_repex_to_local(edge_out_dir, phase, new_or_old, specific_mmml_out_dir, n_snapshots)
 
 
 def get_lig_names(perses_outdir="."):
@@ -247,18 +249,18 @@ def get_lig_names(perses_outdir="."):
     return lig_names
 
 
-def create_output_dirs(perses_outdir=".", mmml_outdir="mmml_corrections", lig_names=None):
+def create_output_dirs(perses_outdir=".", mmml_outdir="mmml_corrections", lig_names=[]):
     """Create output directories for MM-ML switching corrections for all ligands in
     RBFE network.
 
     Args:
         perses_outdir (str, optional): Path to perses output directory. Defaults to ".".
         mmml_outdir (str, optional): Name of mmml output directory to create. Defaults to "mmml_corrections".
-        lig_names (_type_, optional): List of ligand names. Defaults to None, resulting in the use of all ligands
+        lig_names (_type_, optional): List of ligand names. Defaults to [], resulting in the use of all ligands
         in network.
     """
     # Get lig names
-    if lig_names is None:
+    if not lig_names:
         lig_names = get_lig_names(perses_outdir)
 
     # Make output dirs
@@ -267,15 +269,20 @@ def create_output_dirs(perses_outdir=".", mmml_outdir="mmml_corrections", lig_na
         os.makedirs(f"{mmml_outdir}/{lig_name}/complex", exist_ok=True)
 
 
-def extract_all_input(perses_outdir=".", mmml_outdir="mmml_corrections"):
+def extract_all_input(perses_outdir=".", mmml_outdir="mmml_corrections", lig_names=[], n_snapshots=1):
     """Extract input files for MM-ML switching corrections from perses output
 
     Args:
         perses_outdir (str, optional): Path to perses output dir. Defaults to ".".
         mmml_outdir (str, optional): Path to mmml corrections dir. Defaults to "mmml_corrections".
+        lig_names (_type_, optional): List of ligand names. Defaults to [], resulting in the use of all ligands
+        in network.
+        n_snapshots (int, optional): Number of snapshots to extract. Default is 1. If 1, this is extracted from the
+        end of the simulation, otherwise evenly-spaced snapshots are extracted.
     """
     # Get lig names
-    lig_names = get_lig_names(perses_outdir)
+    if not lig_names:
+        lig_names = get_lig_names(perses_outdir)
 
     # Create dirs for mm-ml output
     create_output_dirs(perses_outdir, mmml_outdir, lig_names)
@@ -283,19 +290,17 @@ def extract_all_input(perses_outdir=".", mmml_outdir="mmml_corrections"):
     # Extract input files
     for lig_name in lig_names:
         print(f"Extracting input for {lig_name}")
-        extract_ligand_input(lig_name, perses_outdir, mmml_outdir)
+        extract_ligand_input(lig_name, perses_outdir, mmml_outdir, n_snapshots)
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--perses_outdir", type=str, default=".", help="Path to perses output dir")
     parser.add_argument("--mmml_outdir", type=str, default="mmml_corrections", help="Path to mmml corrections dir")
-    parser.add_argument("--lig_name", type=str, default=None, help="Name of ligand to extract")
+    parser.add_argument("--lig_names", nargs='+', type=str, default=[], help="Names of ligands to extract")
+    parser.add_argument("--n_snapshots", type=int, default=1, help="Number of snapshots to extract")
     args = parser.parse_args()
 
-    if args.lig_name is not None:
-        extract_ligand_input(args.lig_name, args.perses_outdir, args.mmml_outdir)
-    else:
-        extract_all_input(args.perses_outdir, args.mmml_outdir)
+    extract_all_input(args.perses_outdir, args.mmml_outdir, args.lig_names, args.n_snapshots)
 
 
 if __name__ == '__main__':
